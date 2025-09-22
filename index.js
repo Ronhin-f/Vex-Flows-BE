@@ -11,26 +11,41 @@ import triggersRoutes from "./config/routes/triggers.routes.js";
 
 import { pool } from "./db.js";
 
-// 1) Crear app ANTES de usar app.get/app.use
 const app = express();
 
-// 2) Middlewares
+// Si hay proxy (Railway), confiar en X-Forwarded-*
+app.set("trust proxy", 1);
+
+// CORS robusto: CORS_ORIGIN="https://a.com,https://b.com" | "*" | "true"
+function resolveCorsOrigin() {
+  const raw = process.env.CORS_ORIGIN;
+  if (!raw || raw === "*" || raw.toLowerCase() === "true") return true;
+  const list = raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return list.length ? list : true;
+}
+
 app.use(
   cors({
-    origin:
-      (process.env.CORS_ORIGIN?.split(",")
-        .map((s) => s.trim())
-        .filter(Boolean)) || true,
+    origin: resolveCorsOrigin(),
     credentials: true,
   })
 );
 app.use(helmet());
 app.use(morgan("dev"));
-app.use(express.json());
+app.use(express.json({ limit: "1mb" }));
+app.use(express.urlencoded({ extended: false }));
 
-// 3) Healthcheck (si querés saltear DB para hoy, poné HEALTH_SKIP_DB=true en .env)
+// Ping simple
+app.get("/", (_req, res) =>
+  res.json({ ok: true, service: "vex-flows-backend" })
+);
+
+// Healthcheck (podés saltear DB con HEALTH_SKIP_DB=true)
 app.get("/health", async (_req, res) => {
-  if (String(process.env.HEALTH_SKIP_DB).toLowerCase() === "true") {
+  if ((process.env.HEALTH_SKIP_DB || "").toLowerCase() === "true") {
     return res.json({ ok: true, service: "vex-flows-backend", db: "skipped" });
   }
   try {
@@ -38,25 +53,29 @@ app.get("/health", async (_req, res) => {
     res.json({ ok: true, service: "vex-flows-backend", db: "up" });
   } catch (e) {
     console.error("DB healthcheck failed:", e);
-    res.status(500).json({ ok: false, error: e.message || "", code: e.code });
+    res
+      .status(500)
+      .json({ ok: false, error: e.message || "", code: e.code || null });
   }
 });
 
-// 4) Rutas
+// Rutas de API
 app.use("/api/flows", flowsRoutes);
 app.use("/api/messages", messagesRoutes);
 app.use("/api/triggers", triggersRoutes);
 
-// 5) 404 y handler de errores
+// 404 y handler de errores
 app.use((req, res) => res.status(404).json({ ok: false, error: "Not found" }));
 // eslint-disable-next-line no-unused-vars
 app.use((err, req, res, _next) => {
   console.error(err);
-  res.status(err.status || 500).json({ ok: false, error: err.message || "Internal error" });
+  res
+    .status(err.status || 500)
+    .json({ ok: false, error: err.message || "Internal error" });
 });
 
-// 6) Listen
-const port = process.env.PORT || 8082;
-app.listen(port, () => console.log(`[Vex Flows] listening on :${port}`));
+// Listen
+const PORT = process.env.PORT || 8082;
+app.listen(PORT, () => console.log(`[Vex Flows] listening on :${PORT}`));
 
 export default app;
