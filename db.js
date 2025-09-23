@@ -1,10 +1,21 @@
 // backend/db.js
+// Carga .env explícita (no rompe en Railway si no existe archivo)
+import dotenv from "dotenv";
+import { fileURLToPath } from "url";
+import path from "path";
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+dotenv.config({ path: path.join(__dirname, ".env") });
+
 import pg from "pg";
 const { Pool } = pg;
 
 // ---------- helpers ----------
 const toBool = (v) => String(v ?? "").toLowerCase() === "true";
 const norm = (v) => String(v ?? "").toLowerCase();
+
+// Interruptor para forzar no-verify (útil en dev/Windows)
+const forceNoVerify = norm(process.env.FORCE_DB_SSL_NO_VERIFY) === "true";
 
 // Hosts/proveedores que típicamente requieren SSL (o van detrás de proxy)
 const needsSSLByHost = (url) =>
@@ -13,8 +24,10 @@ const needsSSLByHost = (url) =>
 
 // Decide config SSL según env/URL
 function sslConfigFromEnv(url) {
-  const mode = norm(process.env.PGSSLMODE);      // "no-verify" | "require" | ""
-  const dbSsl = toBool(process.env.DB_SSL);      // true/false
+  if (forceNoVerify) return { rejectUnauthorized: false };
+
+  const mode = norm(process.env.PGSSLMODE); // "no-verify" | "require" | etc
+  const dbSsl = toBool(process.env.DB_SSL); // true/false
 
   // Modo explícito desde env primero
   if (mode === "no-verify" || mode === "prefer" || mode === "allow") {
@@ -24,7 +37,7 @@ function sslConfigFromEnv(url) {
     return { rejectUnauthorized: true };
   }
 
-  // Fallback: si DB_SSL=true o el host/URL sugiere SSL -> no-verify (proxy con cert self-signed)
+  // Fallback: si DB_SSL=true o el host/URL sugiere SSL -> no-verify
   if (dbSsl || needsSSLByHost(url)) {
     return { rejectUnauthorized: false };
   }
