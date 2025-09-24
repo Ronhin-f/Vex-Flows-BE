@@ -1,5 +1,23 @@
-// backend/index.js
-import "dotenv/config";
+// === .env (carga explícita desde backend/.env) ===============================
+import dotenv from "dotenv";
+import { fileURLToPath } from "url";
+import path from "path";
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+dotenv.config({ override: true });
+
+// Defaults útiles para dev local (no pisan valores existentes)
+process.env.PORT ??= "8082";
+process.env.CORS_ORIGIN ??= "http://localhost:5173";
+
+// (solo debug sano; NO logeamos secretos)
+console.log("[Vex Flows] env check:", {
+  CORS_ORIGIN: process.env.CORS_ORIGIN,
+  PGSSLMODE: process.env.PGSSLMODE,
+  DB_SSL: process.env.DB_SSL,
+  URL_has_sslmode: (process.env.DATABASE_URL || "").includes("sslmode="),
+});
+
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
@@ -8,7 +26,8 @@ import morgan from "morgan";
 import flowsRoutes from "./config/routes/flows.routes.js";
 import messagesRoutes from "./config/routes/messages.routes.js";
 import triggersRoutes from "./config/routes/triggers.routes.js";
-
+import providersRouter from "./config/routes/providers.routes.js";
+import { initScheduler } from "./services/scheduler.service.js";
 import { pool } from "./db.js";
 
 const app = express();
@@ -20,10 +39,7 @@ app.set("trust proxy", 1);
 function resolveCorsOrigin() {
   const raw = process.env.CORS_ORIGIN;
   if (!raw || raw === "*" || raw.toLowerCase() === "true") return true;
-  const list = raw
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
+  const list = raw.split(",").map((s) => s.trim()).filter(Boolean);
   return list.length ? list : true;
 }
 
@@ -53,9 +69,11 @@ app.get("/health", async (_req, res) => {
     res.json({ ok: true, service: "vex-flows-backend", db: "up" });
   } catch (e) {
     console.error("DB healthcheck failed:", e);
-    res
-      .status(500)
-      .json({ ok: false, error: e.message || "", code: e.code || null });
+    res.status(500).json({
+      ok: false,
+      error: e.message || "",
+      code: e.code || null,
+    });
   }
 });
 
@@ -63,6 +81,7 @@ app.get("/health", async (_req, res) => {
 app.use("/api/flows", flowsRoutes);
 app.use("/api/messages", messagesRoutes);
 app.use("/api/triggers", triggersRoutes);
+app.use("/api/providers", providersRouter);
 
 // 404 y handler de errores
 app.use((req, res) => res.status(404).json({ ok: false, error: "Not found" }));
@@ -75,7 +94,10 @@ app.use((err, req, res, _next) => {
 });
 
 // Listen
-const PORT = process.env.PORT || 8082;
+const PORT = Number(process.env.PORT || 8082);
 app.listen(PORT, () => console.log(`[Vex Flows] listening on :${PORT}`));
+
+// Iniciar scheduler DESPUÉS de levantar el server
+initScheduler();
 
 export default app;
