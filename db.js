@@ -1,141 +1,71 @@
 // backend/db.js
-// Carga .env explícita (no rompe en Railway si no existe archivo)
-import dotenv from "dotenv";
-import { fileURLToPath } from "url";
-import path from "path";
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-dotenv.config({ path: path.join(__dirname, ".env") });
-
+import "dotenv/config";
 import pg from "pg";
 const { Pool } = pg;
 
-// ---------- helpers ----------
-const toBool = (v) => String(v ?? "").toLowerCase() === "true";
-const norm = (v) => String(v ?? "").toLowerCase();
-
-// Interruptor para forzar no-verify (útil en dev/Windows)
-const forceNoVerify = norm(process.env.FORCE_DB_SSL_NO_VERIFY) === "true";
-
-// Hosts/proveedores que típicamente requieren SSL (o van detrás de proxy)
-const needsSSLByHost = (url) =>
-  /sslmode=|rlwy\.net|railway|metro\.proxy\.rlwy\.net|neon\.tech|supabase\.co|render\.com|amazonaws\.com|herokuapp\.com/i
-    .test(url || "");
-
-// Decide config SSL según env/URL
-function sslConfigFromEnv(url) {
-  if (forceNoVerify) return { rejectUnauthorized: false };
-
-  const mode = norm(process.env.PGSSLMODE); // "no-verify" | "require" | etc
-  const dbSsl = toBool(process.env.DB_SSL); // true/false
-
-  // Modo explícito desde env primero
-  if (mode === "no-verify" || mode === "prefer" || mode === "allow") {
-    return { rejectUnauthorized: false };
-  }
-  if (mode === "require" || mode === "verify-full" || mode === "verify-ca") {
-    return { rejectUnauthorized: true };
-  }
-
-  // Fallback: si DB_SSL=true o el host/URL sugiere SSL -> no-verify
-  if (dbSsl || needsSSLByHost(url)) {
-    return { rejectUnauthorized: false };
-  }
-
-  // Sin SSL
-  return false;
+// 🔧 Kill switch SOLO si lo pedimos por env (dev/local/Railway con cert intermedio)
+if (String(process.env.FORCE_DB_SSL_NO_VERIFY).toLowerCase() === "true") {
+  // Desactiva la verificación de la cadena TLS en TODO el proceso
+  process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+  console.log("[db] TLS verify disabled via FORCE_DB_SSL_NO_VERIFY");
 }
 
-function buildConfig() {
-  const url = process.env.DATABASE_URL;
-
-  if (url) {
-    return {
-      connectionString: url,
-      ssl: sslConfigFromEnv(url),
-      max: Number(process.env.PGPOOL_MAX || 10),
-      idleTimeoutMillis: Number(process.env.PG_IDLE_TIMEOUT || 30_000),
-      connectionTimeoutMillis: Number(process.env.PG_CONNECTION_TIMEOUT || 10_000),
-    };
-  }
-
-  // Local por variables sueltas
-  return {
-    host: process.env.PGHOST || "localhost",
-    port: Number(process.env.PGPORT || 5432),
-    user: process.env.PGUSER || "postgres",
-    password: process.env.PGPASSWORD || "",
-    database: process.env.PGDATABASE || "vex_flows",
-    ssl: sslConfigFromEnv(),
-    max: Number(process.env.PGPOOL_MAX || 10),
-    idleTimeoutMillis: Number(process.env.PG_IDLE_TIMEOUT || 30_000),
-    connectionTimeoutMillis: Number(process.env.PG_CONNECTION_TIMEOUT || 10_000),
-  };
+// 🔒 Falla explícito si falta la URL
+if (!process.env.DATABASE_URL) {
+  throw new Error(
+    "DATABASE_URL is missing. Asegurate de tener backend/.env o variables en Railway."
+  );
 }
 
-export const pool = new Pool(buildConfig());
-
-// Log limpio si el pool tiene un error asíncrono
-pool.on("error", (err) => {
-  console.error("PG pool error:", err);
+// 🌐 Pool PG con SSL no-verify (evita SELF_SIGNED_CERT_IN_CHAIN)
+export const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
 });
 
-// ----------------------------
-// Auto-migración mínima (idempotente)
-// ----------------------------
-async function initSchema() {
-  if (toBool(process.env.HEALTH_SKIP_DB)) {
-    console.log("⏭️  HEALTH_SKIP_DB=true → se salta creación de esquema al boot.");
-    return;
-  }
+console.log("[db] url mode -> ssl:", true, "rejectUnauthorized=false");
 
-  let client;
-  try {
-    client = await pool.connect();
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS flows (
-        id BIGSERIAL PRIMARY KEY,
-        name TEXT NOT NULL,
-        description TEXT,
-        active BOOLEAN DEFAULT TRUE,
-        meta JSONB DEFAULT '{}'::jsonb,
-        created_at TIMESTAMPTZ DEFAULT now(),
-        updated_at TIMESTAMPTZ DEFAULT now()
-      );
-
-      CREATE TABLE IF NOT EXISTS triggers (
-        id BIGSERIAL PRIMARY KEY,
-        flow_id BIGINT REFERENCES flows(id) ON DELETE CASCADE,
-        type TEXT NOT NULL,
-        schedule TEXT,
-        active BOOLEAN DEFAULT TRUE,
-        config JSONB DEFAULT '{}'::jsonb,
-        created_at TIMESTAMPTZ DEFAULT now(),
-        updated_at TIMESTAMPTZ DEFAULT now()
-      );
-
-      CREATE TABLE IF NOT EXISTS messages (
-        id BIGSERIAL PRIMARY KEY,
-        flow_id BIGINT REFERENCES flows(id) ON DELETE SET NULL,
-        channel TEXT NOT NULL,
-        recipient TEXT,
-        subject TEXT,
-        body TEXT,
-        status TEXT DEFAULT 'draft',
-        meta JSONB DEFAULT '{}'::jsonb,
-        created_at TIMESTAMPTZ DEFAULT now(),
-        updated_at TIMESTAMPTZ DEFAULT now()
-      );
-    `);
-    console.log("✅ Tablas chequeadas/creadas");
-  } catch (err) {
-    // No tumbar el proceso por errores de conexión/SSL; loguear y seguir
-    console.error("❌ Error creando tablas:", err);
-  } finally {
-    try { client?.release?.(); } catch {}
-  }
+// ✅ Ping DB usando el MISMO Pool
+export async function pingDb() {
+  await pool.query("SELECT 1");
 }
 
-initSchema();
-
-export default pool;
+// 🗄️ Migración mínima
+export async function initSchema() {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS flows (
+        id SERIAL PRIMARY KEY,
+        name TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT now()
+      );
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS triggers (
+        id SERIAL PRIMARY KEY,
+        flow_id INT REFERENCES flows(id) ON DELETE CASCADE,
+        type TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT now()
+      );
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS messages (
+        id SERIAL PRIMARY KEY,
+        flow_id INT REFERENCES flows(id) ON DELETE CASCADE,
+        channel TEXT NOT NULL,
+        payload JSONB DEFAULT '{}'::jsonb,
+        created_at TIMESTAMP DEFAULT now()
+      );
+    `);
+    await client.query("COMMIT");
+    console.log("[db] schema ok");
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("❌ Error creando tablas:", err);
+    throw err;
+  } finally {
+    client.release();
+  }
+}

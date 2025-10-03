@@ -1,0 +1,73 @@
+@base = http://127.0.0.1:8082
+@json = application/json
+
+### Health
+GET {{base}}/health
+
+### Listar providers
+GET {{base}}/api/providers
+
+### Conectar WhatsApp (simulado o real)
+POST {{base}}/api/providers/whatsapp/connect
+Content-Type: {{json}}
+
+{
+  "credentials": { "token": "TEST" }
+}
+
+### Recetas
+GET {{base}}/api/flows/recipes
+
+
+### Crear Flow (desde wizard)
+# @name createFlow
+POST {{base}}/api/flows/create
+Content-Type: {{json}}
+
+{
+  "name": "Demo desde VSCode",
+  "trigger": "crm.lead.created",
+  "steps": [
+    { "type": "whatsapp.send", "template_id": "welcome", "to": "{{lead.assigned.phone}}" },
+    { "type": "task.create", "assignee": "daniel.vernon", "due": "+2d" }
+  ]
+}
+
+> {%
+/**
+ * Guarda el id del flow creado para usarlo en Publish.
+ * (Extensión REST Client de VS Code)
+ */
+try {
+  const data = JSON.parse(response.body);
+  if (data && data.id) {
+    client.global.set("flow_id", data.id);
+  }
+} catch (e) {}
+%}
+
+
+### Publicar Flow
+# Usa el id guardado en el paso anterior
+POST {{base}}/api/flows/publish
+Content-Type: {{json}}
+
+{ "flow_id": "{{flow_id}}" }
+
+
+### Emitir trigger (simula crm.lead.created)
+POST {{base}}/api/triggers/emit
+Content-Type: {{json}}
+
+{
+  "event": "crm.lead.created",
+  "payload": {
+    "lead": {
+      "assigned": { "phone": "+5492610000000" },
+      "id": "LEAD-TEST-1"
+    }
+  }
+}
+
+### Activity (últimos 10)
+GET {{base}}/api/flow-runs?limit=10

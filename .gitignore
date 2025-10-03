@@ -1,7 +1,15 @@
+# Node/Vite
 node_modules/
+dist/
+.vite/
+.cache/
+
+# Env / secretos
 .env
 .env.*
 *.log
-npm-debug.log*
-dist/
-coverage/
+
+# Editor/OS
+.vscode/
+.DS_Store
+Thumbs.db
