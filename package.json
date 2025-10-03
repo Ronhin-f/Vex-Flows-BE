@@ -1,28 +1,43 @@
 {
   "name": "vex-flows-backend",
-  "version": "1.0.0",
+  "version": "1.0.3",
+  "private": true,
   "description": "Backend de Vex Flows - automatizaciones y mensajes",
   "type": "module",
-  "main": "src/index.js",
+  "main": "index.js",
   "scripts": {
     "dev": "nodemon index.js",
     "start": "node index.js"
   },
   "dependencies": {
-    "axios": "^1.7.0",
+    "axios": "^1.7.2",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
-    "helmet": "^7.2.0",
+    "helmet": "^7.1.0",
     "jsonwebtoken": "^9.0.2",
-    "morgan": "^1.10.1",
+    "morgan": "^1.10.0",
     "node-cron": "^3.0.3",
     "nodemailer": "^6.9.13",
-    "pg": "^8.11.5"
+    "pg": "^8.12.0"
   },
   "devDependencies": {
-    "nodemon": "^3.1.4"
+    "nodemon": "^3.1.10"
   },
-  "author": "Vector Argentina Inc.",
-  "license": "MIT"
+  "engines": {
+    "node": ">=20 <23"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Ronhin-f/Vex-Flows-BE.git"
+  },
+  "license": "MIT",
+  "keywords": [
+    "vex",
+    "flows",
+    "vector-argentina",
+    "backend",
+    "express",
+    "pg"
+  ]
 }
