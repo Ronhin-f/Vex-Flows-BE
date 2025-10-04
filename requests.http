@@ -1,13 +1,16 @@
-@base = http://127.0.0.1:8082
+### ===== SELECCIONAR BACKEND =====
+@base = https://TU-BACKEND.railway.app
+# @base = http://127.0.0.1:8082
+
 @json = application/json
 
 ### Health
 GET {{base}}/health
 
-### Listar providers
+### Providers
 GET {{base}}/api/providers
 
-### Conectar WhatsApp (simulado o real)
+### Connect WhatsApp (mock)
 POST {{base}}/api/providers/whatsapp/connect
 Content-Type: {{json}}
 
@@ -15,7 +18,7 @@ Content-Type: {{json}}
   "credentials": { "token": "TEST" }
 }
 
-### Recetas
+### Recipes
 GET {{base}}/api/flows/recipes
 
 
@@ -25,34 +28,40 @@ POST {{base}}/api/flows/create
 Content-Type: {{json}}
 
 {
-  "name": "Demo desde VSCode",
+  "name": "Demo Prod",
   "trigger": "crm.lead.created",
   "steps": [
     { "type": "whatsapp.send", "template_id": "welcome", "to": "{{lead.assigned.phone}}" },
-    { "type": "task.create", "assignee": "daniel.vernon", "due": "+2d" }
+    { "type": "task.create", "assignee": "natali", "due": "+2d" }
   ]
 }
 
 > {%
 /**
  * Guarda el id del flow creado para usarlo en Publish.
- * (Extensión REST Client de VS Code)
+ * (VS Code REST Client)
  */
 try {
   const data = JSON.parse(response.body);
   if (data && data.id) {
     client.global.set("flow_id", data.id);
+    client.log("flow_id guardado: " + data.id);
+  } else {
+    client.log("No se pudo leer flow_id del response");
   }
-} catch (e) {}
+} catch (e) {
+  client.log("Error parseando response: " + e.message);
+}
 %}
 
 
-### Publicar Flow
-# Usa el id guardado en el paso anterior
+### Publicar Flow (usa {{flow_id}})
 POST {{base}}/api/flows/publish
 Content-Type: {{json}}
 
-{ "flow_id": "{{flow_id}}" }
+{
+  "flow_id": "{{flow_id}}"
+}
 
 
 ### Emitir trigger (simula crm.lead.created)
@@ -68,6 +77,7 @@ Content-Type: {{json}}
     }
   }
 }
+
 
 ### Activity (últimos 10)
 GET {{base}}/api/flow-runs?limit=10
