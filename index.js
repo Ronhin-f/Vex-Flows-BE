@@ -13,6 +13,9 @@ import flowsRoutes from "./config/routes/flows.routes.js";
 import messagesRoutes from "./config/routes/messages.routes.js";
 import triggersRoutes from "./config/routes/triggers.routes.js";
 
+// Auth Core (nuevo)
+import auth from "./config/middleware/auth.js";
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Scheduler: import dinámico + fallback para que NUNCA crashee en prod
 let initScheduler = () => console.log("🕒 Scheduler omitido (opcional)");
@@ -133,7 +136,7 @@ const getRuns = async (org_id, limit = 20) =>
 
 /* ───────────── Endpoints mínimos que consume el frontend ───────────── */
 
-// Providers
+// Públicos (no requieren token)
 app.get("/api/providers", async (req, res) => {
   try {
     const org_id = req.user?.org_id || mem.orgId;
@@ -147,7 +150,26 @@ app.get("/api/providers", async (req, res) => {
   }
 });
 
-app.post("/api/providers/:id/connect", async (req, res) => {
+app.get("/api/flows/recipes", async (_req, res) => {
+  try {
+    res.json(await getRecipes());
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.get("/api/flow-runs", async (req, res) => {
+  try {
+    const org_id = req.user?.org_id || mem.orgId;
+    const limit = Math.min(parseInt(req.query.limit || "20", 10), 100);
+    res.json(await getRuns(org_id, limit));
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Protegidos (requieren token de Core)
+app.post("/api/providers/:id/connect", auth, async (req, res) => {
   try {
     const org_id = req.user?.org_id || mem.orgId;
     const id = req.params.id;
@@ -159,17 +181,7 @@ app.post("/api/providers/:id/connect", async (req, res) => {
   }
 });
 
-// Flows Library
-app.get("/api/flows/recipes", async (_req, res) => {
-  try {
-    res.json(await getRecipes());
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-// Crear flow
-app.post("/api/flows/create", async (req, res) => {
+app.post("/api/flows/create", auth, async (req, res) => {
   try {
     const org_id = req.user?.org_id || mem.orgId;
     const payload = req.body || {};
@@ -180,8 +192,7 @@ app.post("/api/flows/create", async (req, res) => {
   }
 });
 
-// Publicar flow (stub dev)
-app.post("/api/flows/publish", async (req, res) => {
+app.post("/api/flows/publish", auth, async (req, res) => {
   try {
     const org_id = req.user?.org_id || mem.orgId;
     const { flow_id } = req.body || {};
@@ -193,8 +204,7 @@ app.post("/api/flows/publish", async (req, res) => {
   }
 });
 
-// Emitir trigger (simula evento y genera runs)
-app.post("/api/triggers/emit", async (req, res) => {
+app.post("/api/triggers/emit", auth, async (req, res) => {
   try {
     const org_id = req.user?.org_id || mem.orgId;
     const { event, payload } = req.body || {};
@@ -226,22 +236,14 @@ app.post("/api/triggers/emit", async (req, res) => {
   }
 });
 
-// Activity
-app.get("/api/flow-runs", async (req, res) => {
-  try {
-    const org_id = req.user?.org_id || mem.orgId;
-    const limit = Math.min(parseInt(req.query.limit || "20", 10), 100);
-    res.json(await getRuns(org_id, limit));
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-/* ───────────── Montaje de routers existentes ───────────── */
+/* ───────────── Montaje de routers existentes ─────────────
+   Los routers de flows/messages/triggers quedan protegidos por Core.
+   Providers queda público para GET; si tu router también escribe, usá auth ahí dentro.
+*/
 app.use("/api/providers", providersRoutes);
-app.use("/api/flows", flowsRoutes);
-app.use("/api/messages", messagesRoutes);
-app.use("/api/triggers", triggersRoutes);
+app.use("/api/flows", auth, flowsRoutes);
+app.use("/api/messages", auth, messagesRoutes);
+app.use("/api/triggers", auth, triggersRoutes);
 
 /* ───────────── 404 controlado ───────────── */
 app.use((req, res) => {
@@ -258,6 +260,8 @@ app.listen(PORT, HOST, async () => {
     PGSSLMODE: process.env.PGSSLMODE,
     DB_SSL: process.env.DB_SSL,
     CORS_ORIGIN: process.env.CORS_ORIGIN,
+    CORE_AUTH_MODE: process.env.CORE_AUTH_MODE,
+    CORE_URL: process.env.CORE_URL,
   });
   console.log(`[Vex Flows] listening on http://${HOST}:${PORT}`);
 
