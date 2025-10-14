@@ -2,7 +2,7 @@
 import express from "express";
 import helmet from "helmet";
 import morgan from "morgan";
-// No usamos cors() con opciones: dejamos hardening manual de CORS
+// No usamos cors() con opciones: hardening manual de CORS
 // import cors from "cors";
 
 import { initSchema, pingDb } from "./db.js";
@@ -31,8 +31,6 @@ app.use(express.urlencoded({ extended: true }));
 app.use(morgan("tiny"));
 
 /* ───────── CORS Hardening (ANTES de rutas) ─────────
-   Usa CORS_ORIGIN con orígenes separados por coma.
-   Ejemplo PROD:
    CORS_ORIGIN="https://vex-flows-fe.vercel.app,https://vex-core-frontend.vercel.app"
    Podés activar DEV_CORS_OPEN=true para diagnóstico temporal (refleja cualquier Origin).
 */
@@ -60,27 +58,18 @@ app.use((req, res, next) => {
   if (DEV_CORS_OPEN) {
     res.setHeader("Access-Control-Allow-Origin", origin || "*");
   } else if (origin && allowset.has(origin)) {
-    // Devolver el mismo origin permitido (no "*")
-    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Access-Control-Allow-Origin", origin); // no "*"
   }
-  // Para caches/proxy
-  res.setHeader("Vary", "Origin");
-  // Métodos y headers que soportamos
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
-  // Incluimos algunos headers extra por si algún lib mete de más
-  res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Requested-With");
-  // No usamos cookies/cors con credenciales
-  // res.setHeader("Access-Control-Allow-Credentials", "false");
 
-  // Preflight corto
-  if (req.method === "OPTIONS") {
-    return res.status(204).end();
-  }
+  res.setHeader("Vary", "Origin");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Requested-With");
+
+  if (req.method === "OPTIONS") return res.status(204).end();
   next();
 });
 
-// (Si querés mantener cors() básico, ponelo DESPUÉS del hardening. No es necesario.)
-// app.use(cors());
+// app.use(cors()); // no necesario
 
 /* ───────── Healthcheck ───────── */
 app.get("/api/health", async (_req, res) => {
@@ -91,6 +80,8 @@ app.get("/api/health", async (_req, res) => {
     res.status(500).json({ ok: false, error: e?.message || "db error", code: e?.code });
   }
 });
+// Root 200 por si Railway chequea "/"
+app.get("/", (_req, res) => res.status(200).send("ok: vex-flows-be"));
 app.get(["/health", "/healthz"], (_req, res) => res.json({ ok: true, service: "vex-flows-backend" }));
 
 /* ───────── In-Memory MVP (no rompe si no hay DB) ───────── */
@@ -108,7 +99,6 @@ const mem = {
 let seqFlow = 1;
 let seqRun  = 1;
 
-// helpers
 const getProviders = async (_org_id) => Array.from(mem.providers.values());
 const connectProvider = async (_org_id, id, credentials) => {
   const p = mem.providers.get(id);
@@ -254,7 +244,7 @@ app.post("/api/triggers/emit", auth, async (req, res) => {
   }
 });
 
-// Montaje de routers existentes (si definen POST, ya pasan por auth arriba)
+// Routers existentes (si definen POST, ya pasan por auth arriba)
 app.use("/api/providers", providersRoutes);
 app.use("/api/flows", auth, flowsRoutes);
 app.use("/api/messages", auth, messagesRoutes);
@@ -266,10 +256,12 @@ app.use((req, res) => {
 });
 
 /* ───────── Server ───────── */
-const PORT = Number(process.env.PORT) || 8082;
-const HOST = process.env.HOST || "0.0.0.0";
+const isRailway = !!process.env.RAILWAY_ENVIRONMENT || !!process.env.RAILWAY_STATIC_URL;
+const PORT = isRailway ? Number(process.env.PORT) : Number(process.env.PORT || 8082);
+const HOST = "0.0.0.0";
+
 app.listen(PORT, HOST, async () => {
-  console.log("[Vex Flows] up:", { PORT, HOST, allowset: [...allowset] });
+  console.log("[Vex Flows] up:", { PORT, HOST, isRailway, allowset: [...allowset] });
   console.log("[Vex Flows] env check:", {
     has_DATABASE_URL: !!process.env.DATABASE_URL,
     PGSSLMODE: process.env.PGSSLMODE,
