@@ -1,8 +1,9 @@
 // backend/index.js
 import express from "express";
-import cors from "cors";
 import helmet from "helmet";
 import morgan from "morgan";
+// OJO: ya no usamos cors() con opciones; dejamos hardening manual
+// import cors from "cors";
 
 import { initSchema, pingDb } from "./db.js";
 
@@ -29,29 +30,39 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(morgan("tiny"));
 
-/* ───────── CORS allowlist desde env ─────────
-   CORS_ORIGIN="https://vex-core-frontend.vercel.app,https://vex-flows-fe.vercel.app"
+/* ───────── CORS Hardening (ANTES de rutas) ─────────
+   Usa CORS_ORIGIN con orígenes separados por coma.
+   Ejemplo PROD:
+   CORS_ORIGIN="https://vex-flows-fe.vercel.app,https://vex-core-frontend.vercel.app"
 */
-const allowlist = new Set(
-  String(process.env.CORS_ORIGIN || "")
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean)
-);
+const rawOrigins = String(process.env.CORS_ORIGIN || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+const allowset = new Set(rawOrigins);
 
-const corsOptions = {
-  origin(origin, cb) {
-    if (!origin) return cb(null, true); // curl/Thunder
-    if (allowlist.has(origin)) return cb(null, true);
-    return cb(new Error(`CORS: origin not allowed: ${origin}`));
-  },
-  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"],
-  credentials: false,
-  optionsSuccessStatus: 204,
-};
-app.use(cors(corsOptions));
-app.options("*", cors(corsOptions));
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin && allowset.has(origin)) {
+    // Devolver el mismo origin permitido (no "*")
+    res.setHeader("Access-Control-Allow-Origin", origin);
+  }
+  // Para caches/proxy
+  res.setHeader("Vary", "Origin");
+  // Métodos y headers que soportamos
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
+  // No usamos cookies
+  // res.setHeader("Access-Control-Allow-Credentials", "false");
+  // Preflight corto
+  if (req.method === "OPTIONS") {
+    return res.status(204).end();
+  }
+  next();
+});
+
+// (Si querés mantener cors() básico, ponelo DESPUÉS del hardening. No es necesario.)
+// app.use(cors());
 
 /* ───────── Healthcheck ───────── */
 app.get("/api/health", async (_req, res) => {
@@ -240,7 +251,7 @@ app.use((req, res) => {
 const PORT = Number(process.env.PORT) || 8082;
 const HOST = process.env.HOST || "0.0.0.0";
 app.listen(PORT, HOST, async () => {
-  console.log("[Vex Flows] up:", { PORT, HOST, allowlist: [...allowlist] });
+  console.log("[Vex Flows] up:", { PORT, HOST, allowlist: [...allowset] });
   console.log("[Vex Flows] env check:", {
     has_DATABASE_URL: !!process.env.DATABASE_URL,
     PGSSLMODE: process.env.PGSSLMODE,
