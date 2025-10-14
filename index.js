@@ -45,7 +45,6 @@ console.log("[CORS] allowset:", [...allowset], "DEV_CORS_OPEN:", DEV_CORS_OPEN);
 app.use((req, res, next) => {
   const origin = req.headers.origin;
 
-  // Log útil de preflight
   if (req.method === "OPTIONS") {
     console.log("[CORS OPTIONS]", {
       origin,
@@ -93,27 +92,76 @@ const mem = {
     ["sms",      { id: "sms",      kind: "sms",      label: "SMS",      desc: "Requiere Twilio SID/Token", status: "pending", credentials: {} }],
     ["slack",    { id: "slack",    kind: "slack",    label: "Slack",    desc: "1 minuto · 2 pasos",        status: "pending", credentials: {} }],
   ]),
-  flows: [],
-  flowRuns: [],
+  flows: [],           // { id, org_id, name, enabled, definition_json, ... }
+  flowRuns: [],        // { id, org_id, flow_id, flow_name, status, ... }
 };
 let seqFlow = 1;
 let seqRun  = 1;
 
+/* ───────── Providers helpers ───────── */
 const getProviders = async (_org_id) => Array.from(mem.providers.values());
+
 const connectProvider = async (_org_id, id, credentials) => {
   const p = mem.providers.get(id);
   if (!p) throw new Error("provider_not_found");
+
+  // Guardamos credenciales tal cual; para Slack esperamos { webhook_url }
   p.status = "connected";
   p.credentials = credentials || {};
   p.last_check_at = new Date().toISOString();
   mem.providers.set(id, p);
+
+  // Test mínimo de Slack si viene webhook
+  if (id === "slack" && p.credentials?.webhook_url) {
+    try {
+      await postToSlack(p.credentials.webhook_url, `✅ Vex Flows conectado (${new Date().toISOString()})`);
+    } catch (e) {
+      console.warn("[slack] test failed:", e?.message);
+    }
+  }
   return { status: "connected" };
 };
+
+function getSlackWebhook(org_id = 1) {
+  const p = mem.providers.get("slack");
+  return p?.status === "connected" ? p?.credentials?.webhook_url : null;
+}
+
+async function postToSlack(webhookUrl, text) {
+  if (!webhookUrl) throw new Error("missing_slack_webhook");
+  const res = await fetch(webhookUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text }),
+  });
+  if (!res.ok) {
+    const t = await res.text().catch(() => "");
+    throw new Error(`slack_post_failed ${res.status}: ${t}`);
+  }
+}
+
+/* ───────── Recipes ───────── */
 const getRecipes = async () => ([
   { id: "lead_whatsapp_task", title: "New lead ➜ WhatsApp + Task", trigger: "crm.lead.created" },
   { id: "lead_won",           title: "Lead won",                   trigger: "crm.lead.won" },
   { id: "invoice_due",        title: "Invoice expiring",           trigger: "billing.invoice.due" },
+
+  // ★ Nuevo preset: Bid sent → Slack reminders
+  {
+    id: "bid_sent_slack",
+    title: "Bid sent ➜ Slack reminders",
+    trigger: "crm.deal.bid_sent",
+    // steps por defecto: +1d, +4d, +7d, +12d (último toque a 5 días después del tercero).
+    steps: [
+      { type: "slack.post", delay_days: 1,  template: "🔔 Follow-up 1/4 for *{{deal.name}}* (Bid sent yesterday)." },
+      { type: "slack.post", delay_days: 4,  template: "🔔 Follow-up 2/4 for *{{deal.name}}* (3 days later)." },
+      { type: "slack.post", delay_days: 7,  template: "🔔 Follow-up 3/4 for *{{deal.name}}* (another 3 days)." },
+      { type: "slack.post", delay_days: 12, template: "🔔 Final follow-up for *{{deal.name}}* (+5 days). Close or reschedule." },
+    ],
+  },
 ]);
+
+/* ───────── Flows CRUD (memoria) ───────── */
 const createFlow = async (org_id, { name, trigger, steps }) => {
   const now = new Date();
   const flow = {
@@ -126,6 +174,8 @@ const createFlow = async (org_id, { name, trigger, steps }) => {
     created_at: now.toISOString(),
   };
   mem.flows.push(flow);
+
+  // Guardamos un run de “alta” para que Activity tenga algo
   mem.flowRuns.unshift({
     id: seqRun++,
     org_id,
@@ -135,8 +185,10 @@ const createFlow = async (org_id, { name, trigger, steps }) => {
     started_at: now.toISOString(),
     finished_at: now.toISOString(),
   });
+
   return { id: flow.id, ok: true };
 };
+
 const publishFlow = async (org_id, flow_id) => {
   const flow = mem.flows.find((f) => f.id === Number(flow_id) && f.org_id === org_id);
   if (!flow) throw new Error("flow_not_found");
@@ -144,8 +196,69 @@ const publishFlow = async (org_id, flow_id) => {
   flow.published_at = new Date().toISOString();
   return { ok: true, flow_id: flow.id, status: "published" };
 };
+
 const getRuns = async (org_id, limit = 20) =>
   mem.flowRuns.filter((r) => r.org_id === org_id).slice(0, limit);
+
+/* ───────── Mini-runner: procesa steps slack.post con delay_days ─────────
+   ⚠️ MVP: usa setTimeout en memoria (sirve para demo; no sobrevive redeploy).
+   Para prod real, mover a scheduler persistente/queue.
+*/
+function scheduleSlackPosts({ org_id, flow, payload }) {
+  const webhook = getSlackWebhook(org_id);
+  if (!webhook) {
+    console.warn("[slack] webhook missing; skipping");
+    return [];
+  }
+
+  const steps = flow?.definition_json?.steps || [];
+  const createdRunIds = [];
+
+  for (const s of steps) {
+    if (s?.type !== "slack.post") continue;
+
+    const delayDays = Number(s.delay_days || 0);
+    const delayMs = Math.max(0, delayDays) * 24 * 60 * 60 * 1000;
+    const runId = seqRun++;
+
+    // Run “scheduled”
+    mem.flowRuns.unshift({
+      id: runId,
+      org_id,
+      flow_id: flow.id,
+      flow_name: flow.name,
+      status: delayMs ? "scheduled" : "processing",
+      started_at: new Date().toISOString(),
+      finished_at: null,
+    });
+    createdRunIds.push(runId);
+
+    const text = (s.template || "🔔 Follow-up for *{{deal.name}}*")
+      .replaceAll("{{deal.name}}", payload?.deal?.name || payload?.deal_name || payload?.name || "deal")
+      .replaceAll("{{deal.owner}}", payload?.deal?.owner || payload?.owner || "owner");
+
+    setTimeout(async () => {
+      try {
+        await postToSlack(webhook, text);
+        // marcar OK
+        const r = mem.flowRuns.find((x) => x.id === runId);
+        if (r) {
+          r.status = "ok";
+          r.finished_at = new Date().toISOString();
+        }
+      } catch (e) {
+        const r = mem.flowRuns.find((x) => x.id === runId);
+        if (r) {
+          r.status = "error";
+          r.finished_at = new Date().toISOString();
+        }
+        console.error("[slack] post failed:", e?.message);
+      }
+    }, delayMs);
+  }
+
+  return createdRunIds;
+}
 
 /* ───────── API mínima que consume el FE ───────── */
 
@@ -162,6 +275,7 @@ app.get("/api/providers", async (req, res) => {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
+
 app.get("/api/flows/recipes", async (_req, res) => {
   try {
     res.json(await getRecipes());
@@ -169,6 +283,7 @@ app.get("/api/flows/recipes", async (_req, res) => {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
+
 app.get("/api/flow-runs", async (req, res) => {
   try {
     const org_id = req.user?.org_id || mem.orgId;
@@ -191,6 +306,7 @@ app.post("/api/providers/:id/connect", auth, async (req, res) => {
     res.status(400).json({ ok: false, error: e.message });
   }
 });
+
 app.post("/api/flows/create", auth, async (req, res) => {
   try {
     const org_id = req.user?.org_id || mem.orgId;
@@ -201,6 +317,7 @@ app.post("/api/flows/create", auth, async (req, res) => {
     res.status(400).json({ ok: false, error: e.message });
   }
 });
+
 app.post("/api/flows/publish", auth, async (req, res) => {
   try {
     const org_id = req.user?.org_id || mem.orgId;
@@ -212,6 +329,7 @@ app.post("/api/flows/publish", auth, async (req, res) => {
     res.status(400).json({ ok: false, error: e.message });
   }
 });
+
 app.post("/api/triggers/emit", auth, async (req, res) => {
   try {
     const org_id = req.user?.org_id || mem.orgId;
@@ -222,15 +340,29 @@ app.post("/api/triggers/emit", auth, async (req, res) => {
       (f) => f.org_id === org_id && f.enabled && f.definition_json?.trigger === event
     );
 
+    // Crea runs y, si aplica, agenda posts a Slack
+    let createdRuns = [];
     const now = new Date();
-    const createdRuns = matches.map((f) => {
-      const run = {
-        id: seqRun++, org_id, flow_id: f.id, flow_name: f.name, status: "ok",
-        started_at: now.toISOString(), finished_at: now.toISOString(),
-      };
-      mem.flowRuns.unshift(run);
-      return run.id;
-    });
+
+    for (const f of matches) {
+      // Si el flow tiene steps slack.post, programar; si no, crear un run simple
+      const hasSlack = (f.definition_json?.steps || []).some(s => s?.type === "slack.post");
+      if (hasSlack) {
+        createdRuns.push(...scheduleSlackPosts({ org_id, flow: f, payload }));
+      } else {
+        const run = {
+          id: seqRun++,
+          org_id,
+          flow_id: f.id,
+          flow_name: f.name,
+          status: "ok",
+          started_at: now.toISOString(),
+          finished_at: now.toISOString(),
+        };
+        mem.flowRuns.unshift(run);
+        createdRuns.push(run.id);
+      }
+    }
 
     res.status(202).json({
       ok: true,
