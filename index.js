@@ -4,56 +4,57 @@ import cors from "cors";
 import helmet from "helmet";
 import morgan from "morgan";
 
-// DB (dotenv se carga dentro de db.js, ESM-safe)
 import { initSchema, pingDb } from "./db.js";
 
-// Routers (pueden convivir con los endpoints MVP)
 import providersRoutes from "./config/routes/providers.routes.js";
 import flowsRoutes from "./config/routes/flows.routes.js";
 import messagesRoutes from "./config/routes/messages.routes.js";
 import triggersRoutes from "./config/routes/triggers.routes.js";
 
-// Auth Core (nuevo)
 import auth from "./config/middleware/auth.js";
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Scheduler: import dinámico + fallback para que NUNCA crashee en prod
+// Scheduler opcional
 let initScheduler = () => console.log("🕒 Scheduler omitido (opcional)");
 try {
   ({ initScheduler } = await import("./config/services/scheduler.service.js"));
 } catch (e) {
   console.warn("[scheduler] no cargado:", e?.message);
 }
-// ─────────────────────────────────────────────────────────────────────────────
 
 const app = express();
 
-/* ───────────── Middlewares base ───────────── */
-app.use(helmet());
+/* ───────── Middlewares base ───────── */
+app.use(helmet({ contentSecurityPolicy: false }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(morgan("tiny"));
 
-/* ───────────── CORS ─────────────
-   Soporta lista separada por comas en CORS_ORIGIN
-   ej: https://tu-frontend.vercel.app,http://localhost:5173
+/* ───────── CORS allowlist desde env ─────────
+   CORS_ORIGIN="https://vex-core-frontend.vercel.app,https://vex-flows-fe.vercel.app"
 */
-const parseOrigins = (v) =>
-  (v ? v.split(",") : ["http://localhost:5173"]).map((s) => s.trim()).filter(Boolean);
-
-const allowedOrigins = parseOrigins(process.env.CORS_ORIGIN);
-app.use(
-  cors({
-    origin: allowedOrigins, // array completo
-    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
-    credentials: false,
-  })
+const allowlist = new Set(
+  String(process.env.CORS_ORIGIN || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)
 );
-app.options("*", cors());
 
-/* ───────────── Healthcheck ───────────── */
-app.get(["/health", "/healthz"], async (_req, res) => {
+const corsOptions = {
+  origin(origin, cb) {
+    if (!origin) return cb(null, true); // curl/Thunder
+    if (allowlist.has(origin)) return cb(null, true);
+    return cb(new Error(`CORS: origin not allowed: ${origin}`));
+  },
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+  credentials: false,
+  optionsSuccessStatus: 204,
+};
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
+
+/* ───────── Healthcheck ───────── */
+app.get("/api/health", async (_req, res) => {
   try {
     await pingDb();
     res.json({ ok: true, service: "vex-flows-backend", db: "up" });
@@ -61,8 +62,9 @@ app.get(["/health", "/healthz"], async (_req, res) => {
     res.status(500).json({ ok: false, error: e?.message || "db error", code: e?.code });
   }
 });
+app.get(["/health", "/healthz"], (_req, res) => res.json({ ok: true, service: "vex-flows-backend" }));
 
-/* ───────────── MVP en memoria ───────────── */
+/* ───────── In-Memory MVP (no rompe si no hay DB) ───────── */
 const mem = {
   orgId: 1,
   providers: new Map([
@@ -71,15 +73,14 @@ const mem = {
     ["sms",      { id: "sms",      kind: "sms",      label: "SMS",      desc: "Requiere Twilio SID/Token", status: "pending", credentials: {} }],
     ["slack",    { id: "slack",    kind: "slack",    label: "Slack",    desc: "1 minuto · 2 pasos",        status: "pending", credentials: {} }],
   ]),
-  flows: [],     // { id, org_id, name, enabled, definition_json, created_by, created_at, published_at? }
-  flowRuns: [],  // { id, org_id, flow_id, flow_name, status, started_at, finished_at }
+  flows: [],
+  flowRuns: [],
 };
 let seqFlow = 1;
 let seqRun  = 1;
 
-// Helpers (luego se reemplazan por queries a DB)
+// helpers
 const getProviders = async (_org_id) => Array.from(mem.providers.values());
-
 const connectProvider = async (_org_id, id, credentials) => {
   const p = mem.providers.get(id);
   if (!p) throw new Error("provider_not_found");
@@ -89,13 +90,11 @@ const connectProvider = async (_org_id, id, credentials) => {
   mem.providers.set(id, p);
   return { status: "connected" };
 };
-
 const getRecipes = async () => ([
   { id: "lead_whatsapp_task", title: "New lead ➜ WhatsApp + Task", trigger: "crm.lead.created" },
   { id: "lead_won",           title: "Lead won",                   trigger: "crm.lead.won" },
   { id: "invoice_due",        title: "Invoice expiring",           trigger: "billing.invoice.due" },
 ]);
-
 const createFlow = async (org_id, { name, trigger, steps }) => {
   const now = new Date();
   const flow = {
@@ -108,8 +107,6 @@ const createFlow = async (org_id, { name, trigger, steps }) => {
     created_at: now.toISOString(),
   };
   mem.flows.push(flow);
-
-  // Run de muestra para que Activity no quede vacío
   mem.flowRuns.unshift({
     id: seqRun++,
     org_id,
@@ -119,10 +116,8 @@ const createFlow = async (org_id, { name, trigger, steps }) => {
     started_at: now.toISOString(),
     finished_at: now.toISOString(),
   });
-
   return { id: flow.id, ok: true };
 };
-
 const publishFlow = async (org_id, flow_id) => {
   const flow = mem.flows.find((f) => f.id === Number(flow_id) && f.org_id === org_id);
   if (!flow) throw new Error("flow_not_found");
@@ -130,13 +125,12 @@ const publishFlow = async (org_id, flow_id) => {
   flow.published_at = new Date().toISOString();
   return { ok: true, flow_id: flow.id, status: "published" };
 };
-
 const getRuns = async (org_id, limit = 20) =>
   mem.flowRuns.filter((r) => r.org_id === org_id).slice(0, limit);
 
-/* ───────────── Endpoints mínimos que consume el frontend ───────────── */
+/* ───────── API mínima que consume el FE ───────── */
 
-// Públicos (no requieren token)
+// Públicos (GET)
 app.get("/api/providers", async (req, res) => {
   try {
     const org_id = req.user?.org_id || mem.orgId;
@@ -149,7 +143,6 @@ app.get("/api/providers", async (req, res) => {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
-
 app.get("/api/flows/recipes", async (_req, res) => {
   try {
     res.json(await getRecipes());
@@ -157,7 +150,6 @@ app.get("/api/flows/recipes", async (_req, res) => {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
-
 app.get("/api/flow-runs", async (req, res) => {
   try {
     const org_id = req.user?.org_id || mem.orgId;
@@ -168,7 +160,7 @@ app.get("/api/flow-runs", async (req, res) => {
   }
 });
 
-// Protegidos (requieren token de Core)
+// Protegidos (POST)
 app.post("/api/providers/:id/connect", auth, async (req, res) => {
   try {
     const org_id = req.user?.org_id || mem.orgId;
@@ -180,7 +172,6 @@ app.post("/api/providers/:id/connect", auth, async (req, res) => {
     res.status(400).json({ ok: false, error: e.message });
   }
 });
-
 app.post("/api/flows/create", auth, async (req, res) => {
   try {
     const org_id = req.user?.org_id || mem.orgId;
@@ -191,7 +182,6 @@ app.post("/api/flows/create", auth, async (req, res) => {
     res.status(400).json({ ok: false, error: e.message });
   }
 });
-
 app.post("/api/flows/publish", auth, async (req, res) => {
   try {
     const org_id = req.user?.org_id || mem.orgId;
@@ -203,7 +193,6 @@ app.post("/api/flows/publish", auth, async (req, res) => {
     res.status(400).json({ ok: false, error: e.message });
   }
 });
-
 app.post("/api/triggers/emit", auth, async (req, res) => {
   try {
     const org_id = req.user?.org_id || mem.orgId;
@@ -236,25 +225,22 @@ app.post("/api/triggers/emit", auth, async (req, res) => {
   }
 });
 
-/* ───────────── Montaje de routers existentes ─────────────
-   Los routers de flows/messages/triggers quedan protegidos por Core.
-   Providers queda público para GET; si tu router también escribe, usá auth ahí dentro.
-*/
+// Montaje de routers existentes (si definen POST, ya pasan por auth arriba)
 app.use("/api/providers", providersRoutes);
 app.use("/api/flows", auth, flowsRoutes);
 app.use("/api/messages", auth, messagesRoutes);
 app.use("/api/triggers", auth, triggersRoutes);
 
-/* ───────────── 404 controlado ───────────── */
+/* ───────── 404 ───────── */
 app.use((req, res) => {
   res.status(404).json({ ok: false, error: "Not found", path: req.path });
 });
 
-/* ───────────── Arranque ───────────── */
+/* ───────── Server ───────── */
 const PORT = Number(process.env.PORT) || 8082;
 const HOST = process.env.HOST || "0.0.0.0";
-
 app.listen(PORT, HOST, async () => {
+  console.log("[Vex Flows] up:", { PORT, HOST, allowlist: [...allowlist] });
   console.log("[Vex Flows] env check:", {
     has_DATABASE_URL: !!process.env.DATABASE_URL,
     PGSSLMODE: process.env.PGSSLMODE,
@@ -263,23 +249,10 @@ app.listen(PORT, HOST, async () => {
     CORE_AUTH_MODE: process.env.CORE_AUTH_MODE,
     CORE_URL: process.env.CORE_URL,
   });
-  console.log(`[Vex Flows] listening on http://${HOST}:${PORT}`);
 
-  try {
-    await initSchema(); // no rompe si no hay DB (ya loguea adentro)
-  } catch {}
-
-  try {
-    initScheduler(app); // si el archivo no existe, ya lo manejamos arriba
-  } catch (e) {
-    console.error("❌ Scheduler error:", e?.message);
-  }
+  try { await initSchema(); } catch {}
+  try { initScheduler(app); } catch (e) { console.error("❌ Scheduler error:", e?.message); }
 });
 
-/* ───────────── Robustez ───────────── */
-process.on("unhandledRejection", (reason) => {
-  console.error("UNHANDLED REJECTION:", reason);
-});
-process.on("uncaughtException", (err) => {
-  console.error("UNCAUGHT EXCEPTION:", err);
-});
+process.on("unhandledRejection", (reason) => console.error("UNHANDLED REJECTION:", reason));
+process.on("uncaughtException", (err) => console.error("UNCAUGHT EXCEPTION:", err));
