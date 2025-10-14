@@ -2,7 +2,7 @@
 import express from "express";
 import helmet from "helmet";
 import morgan from "morgan";
-// OJO: ya no usamos cors() con opciones; dejamos hardening manual
+// No usamos cors() con opciones: dejamos hardening manual de CORS
 // import cors from "cors";
 
 import { initSchema, pingDb } from "./db.js";
@@ -34,16 +34,32 @@ app.use(morgan("tiny"));
    Usa CORS_ORIGIN con orígenes separados por coma.
    Ejemplo PROD:
    CORS_ORIGIN="https://vex-flows-fe.vercel.app,https://vex-core-frontend.vercel.app"
+   Podés activar DEV_CORS_OPEN=true para diagnóstico temporal (refleja cualquier Origin).
 */
+const DEV_CORS_OPEN = String(process.env.DEV_CORS_OPEN || "false").toLowerCase() === "true";
 const rawOrigins = String(process.env.CORS_ORIGIN || "")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
 const allowset = new Set(rawOrigins);
+console.log("[CORS] allowset:", [...allowset], "DEV_CORS_OPEN:", DEV_CORS_OPEN);
 
 app.use((req, res, next) => {
   const origin = req.headers.origin;
-  if (origin && allowset.has(origin)) {
+
+  // Log útil de preflight
+  if (req.method === "OPTIONS") {
+    console.log("[CORS OPTIONS]", {
+      origin,
+      path: req.path,
+      acrh: req.headers["access-control-request-headers"] || "",
+      acrm: req.headers["access-control-request-method"] || "",
+    });
+  }
+
+  if (DEV_CORS_OPEN) {
+    res.setHeader("Access-Control-Allow-Origin", origin || "*");
+  } else if (origin && allowset.has(origin)) {
     // Devolver el mismo origin permitido (no "*")
     res.setHeader("Access-Control-Allow-Origin", origin);
   }
@@ -51,9 +67,11 @@ app.use((req, res, next) => {
   res.setHeader("Vary", "Origin");
   // Métodos y headers que soportamos
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
-  // No usamos cookies
+  // Incluimos algunos headers extra por si algún lib mete de más
+  res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Requested-With");
+  // No usamos cookies/cors con credenciales
   // res.setHeader("Access-Control-Allow-Credentials", "false");
+
   // Preflight corto
   if (req.method === "OPTIONS") {
     return res.status(204).end();
@@ -251,7 +269,7 @@ app.use((req, res) => {
 const PORT = Number(process.env.PORT) || 8082;
 const HOST = process.env.HOST || "0.0.0.0";
 app.listen(PORT, HOST, async () => {
-  console.log("[Vex Flows] up:", { PORT, HOST, allowlist: [...allowset] });
+  console.log("[Vex Flows] up:", { PORT, HOST, allowset: [...allowset] });
   console.log("[Vex Flows] env check:", {
     has_DATABASE_URL: !!process.env.DATABASE_URL,
     PGSSLMODE: process.env.PGSSLMODE,
