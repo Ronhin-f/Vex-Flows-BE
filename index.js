@@ -2,6 +2,10 @@
 import express from "express";
 import helmet from "helmet";
 import morgan from "morgan";
+
+// ⬇️ Ruta correcta del archivo de webhooks
+import webhooks from "./config/routes/webhooks.js";
+
 // No usamos cors() con opciones: hardening manual de CORS
 // import cors from "cors";
 
@@ -11,6 +15,9 @@ import providersRoutes from "./config/routes/providers.routes.js";
 import flowsRoutes from "./config/routes/flows.routes.js";
 import messagesRoutes from "./config/routes/messages.routes.js";
 import triggersRoutes from "./config/routes/triggers.routes.js";
+
+// ⬇️ Nueva: endpoint público /flows/events (lo creamos más abajo)
+import eventsRoutes from "./config/routes/events.routes.js";
 
 import auth from "./config/middleware/auth.js";
 
@@ -151,7 +158,6 @@ const getRecipes = async () => ([
     id: "bid_sent_slack",
     title: "Bid sent ➜ Slack reminders",
     trigger: "crm.deal.bid_sent",
-    // steps por defecto: +1d, +4d, +7d, +12d (último toque a 5 días después del tercero).
     steps: [
       { type: "slack.post", delay_days: 1,  template: "🔔 Follow-up 1/4 for *{{deal.name}}* (Bid sent yesterday)." },
       { type: "slack.post", delay_days: 4,  template: "🔔 Follow-up 2/4 for *{{deal.name}}* (3 days later)." },
@@ -175,7 +181,6 @@ const createFlow = async (org_id, { name, trigger, steps }) => {
   };
   mem.flows.push(flow);
 
-  // Guardamos un run de “alta” para que Activity tenga algo
   mem.flowRuns.unshift({
     id: seqRun++,
     org_id,
@@ -200,10 +205,7 @@ const publishFlow = async (org_id, flow_id) => {
 const getRuns = async (org_id, limit = 20) =>
   mem.flowRuns.filter((r) => r.org_id === org_id).slice(0, limit);
 
-/* ───────── Mini-runner: procesa steps slack.post con delay_days ─────────
-   ⚠️ MVP: usa setTimeout en memoria (sirve para demo; no sobrevive redeploy).
-   Para prod real, mover a scheduler persistente/queue.
-*/
+/* ───────── Mini-runner: procesa steps slack.post con delay_days ───────── */
 function scheduleSlackPosts({ org_id, flow, payload }) {
   const webhook = getSlackWebhook(org_id);
   if (!webhook) {
@@ -221,7 +223,6 @@ function scheduleSlackPosts({ org_id, flow, payload }) {
     const delayMs = Math.max(0, delayDays) * 24 * 60 * 60 * 1000;
     const runId = seqRun++;
 
-    // Run “scheduled”
     mem.flowRuns.unshift({
       id: runId,
       org_id,
@@ -240,7 +241,6 @@ function scheduleSlackPosts({ org_id, flow, payload }) {
     setTimeout(async () => {
       try {
         await postToSlack(webhook, text);
-        // marcar OK
         const r = mem.flowRuns.find((x) => x.id === runId);
         if (r) {
           r.status = "ok";
@@ -340,12 +340,10 @@ app.post("/api/triggers/emit", auth, async (req, res) => {
       (f) => f.org_id === org_id && f.enabled && f.definition_json?.trigger === event
     );
 
-    // Crea runs y, si aplica, agenda posts a Slack
     let createdRuns = [];
     const now = new Date();
 
     for (const f of matches) {
-      // Si el flow tiene steps slack.post, programar; si no, crear un run simple
       const hasSlack = (f.definition_json?.steps || []).some(s => s?.type === "slack.post");
       if (hasSlack) {
         createdRuns.push(...scheduleSlackPosts({ org_id, flow: f, payload }));
@@ -376,11 +374,15 @@ app.post("/api/triggers/emit", auth, async (req, res) => {
   }
 });
 
-// Routers existentes (si definen POST, ya pasan por auth arriba)
+// Routers existentes
 app.use("/api/providers", providersRoutes);
 app.use("/api/flows", auth, flowsRoutes);
 app.use("/api/messages", auth, messagesRoutes);
 app.use("/api/triggers", auth, triggersRoutes);
+
+// ⬇️ Montamos rutas públicas usadas por Gmail Apps Script
+app.use(webhooks);      // POST /webhooks/gmail  (verifica X-VEX-SECRET y reenvía)
+app.use(eventsRoutes);  // POST /flows/events    (consume el evento y notifica Slack)
 
 /* ───────── 404 ───────── */
 app.use((req, res) => {
