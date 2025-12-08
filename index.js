@@ -17,7 +17,7 @@ import messagesRoutes from "./config/routes/messages.routes.js";
 import triggersRoutes from "./config/routes/triggers.routes.js";
 
 // ⬇️ Nueva: endpoint público /flows/events (lo creamos más abajo)
-import eventsRoutes from "./config/routes/events.routes.js";
+import buildEventsRoutes from "./config/routes/events.routes.js";
 
 import auth from "./config/middleware/auth.js";
 
@@ -104,6 +104,23 @@ const mem = {
 };
 let seqFlow = 1;
 let seqRun  = 1;
+
+// Permite a otros routers registrar runs (ej. ingestión de eventos)
+const pushRun = ({ org_id = mem.orgId, flow_id = null, flow_name, status = "ok", meta = {} }) => {
+  const now = new Date();
+  const run = {
+    id: seqRun++,
+    org_id,
+    flow_id,
+    flow_name: flow_name || "Flow",
+    status,
+    started_at: now.toISOString(),
+    finished_at: now.toISOString(),
+    ...meta,
+  };
+  mem.flowRuns.unshift(run);
+  return run;
+};
 
 /* ───────── Providers helpers ───────── */
 const getProviders = async (_org_id) => Array.from(mem.providers.values());
@@ -382,7 +399,15 @@ app.use("/api/triggers", auth, triggersRoutes);
 
 // ⬇️ Montamos rutas públicas usadas por Gmail Apps Script
 app.use(webhooks);      // POST /webhooks/gmail  (verifica X-VEX-SECRET y reenvía)
-app.use(eventsRoutes);  // POST /flows/events    (consume el evento y notifica Slack)
+app.use(
+  buildEventsRoutes({
+    mem,
+    pushRun,
+    postToSlack,
+    getSlackWebhook,
+    scheduleSlackPosts,
+  })
+); // POST /flows/events (CRM/Stock ingestion + recordatorios)
 
 /* ───────── 404 ───────── */
 app.use((req, res) => {
