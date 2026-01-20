@@ -1,16 +1,16 @@
-// backend/config/middleware/auth.js
+﻿// backend/config/middleware/auth.js
 import axios from "axios";
 import jwt from "jsonwebtoken";
 
 /**
- * Modo de autenticación:
- *  - CORE_AUTH_MODE=jwt          -> valida local con CORE_JWT_SECRET o JWT_SECRET
- *  - CORE_AUTH_MODE=introspect   -> valida contra CORE_URL + CORE_INTROSPECT_PATH (GET)
- * Env útiles:
+ * Auth modes:
+ *  - CORE_AUTH_MODE=jwt        -> local validate with CORE_JWT_SECRET or JWT_SECRET
+ *  - CORE_AUTH_MODE=introspect -> validate via CORE_URL + CORE_INTROSPECT_PATH (GET)
+ * Env:
  *  - CORE_URL=https://<core>.up.railway.app
  *  - CORE_INTROSPECT_PATH=/api/auth/introspect
- *  - CORE_JWT_SECRET=xxxxx    (o JWT_SECRET)
- *  - ALLOW_ANON=true          (solo DEV)
+ *  - CORE_JWT_SECRET=xxxxx (or JWT_SECRET)
+ *  - ALLOW_ANON=true (dev only)
  */
 
 const MODE = (process.env.CORE_AUTH_MODE || "introspect").toLowerCase();
@@ -18,7 +18,7 @@ const CORE_URL = (process.env.CORE_URL || "").replace(/\/$/, "");
 const INTROSPECT_PATH = process.env.CORE_INTROSPECT_PATH || "/api/auth/introspect";
 const ALLOW_ANON = String(process.env.ALLOW_ANON || "false").toLowerCase() === "true";
 
-// Cache simple 60s
+// Simple 60s cache
 const cache = new Map(); // token -> { payload, exp }
 const getFromCache = (t) => {
   const hit = cache.get(t);
@@ -50,7 +50,6 @@ async function validateWithIntrospect(token) {
     validateStatus: () => true,
   });
 
-  // Acepta ambos formatos: { ok:true, user } o { active:true, user }
   const active = !!(data && (data.ok === true || data.active === true));
   if (!active) {
     const reason = data?.error || data?.message || "invalid_token";
@@ -67,7 +66,7 @@ async function validateWithIntrospect(token) {
 function validateWithJwt(token) {
   const secret = process.env.CORE_JWT_SECRET || process.env.JWT_SECRET;
   if (!secret) throw new Error("missing_secret");
-  const payload = jwt.verify(token, secret); // lanza si es inválido
+  const payload = jwt.verify(token, secret); // throws if invalid
   return normalizeUser(payload);
 }
 
@@ -98,7 +97,6 @@ export default async function auth(req, res, next) {
       err?.name === "JsonWebTokenError" || err?.name === "TokenExpiredError"
         ? "Invalid or expired token"
         : "core_auth_failed";
-    // Aseguramos 401 (nunca 502 hacia el FE por auth)
     return res.status(401).json({ ok: false, error: msg });
   }
 }

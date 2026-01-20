@@ -1,46 +1,35 @@
-// backend/index.js
+﻿// backend/index.js
 import express from "express";
 import helmet from "helmet";
 import morgan from "morgan";
 
-// ⬇️ Ruta correcta del archivo de webhooks
 import webhooks from "./config/routes/webhooks.js";
 
-// No usamos cors() con opciones: hardening manual de CORS
-// import cors from "cors";
-
-import { initSchema, pingDb } from "./db.js";
+import { initSchema, pingDb, pool } from "./db.js";
 
 import providersRoutes from "./config/routes/providers.routes.js";
 import flowsRoutes from "./config/routes/flows.routes.js";
 import messagesRoutes from "./config/routes/messages.routes.js";
 import triggersRoutes from "./config/routes/triggers.routes.js";
 
-// ⬇️ Nueva: endpoint público /flows/events (lo creamos más abajo)
 import buildEventsRoutes from "./config/routes/events.routes.js";
 
 import auth from "./config/middleware/auth.js";
 
-// Scheduler opcional
-let initScheduler = () => console.log("🕒 Scheduler omitido (opcional)");
+let initScheduler = () => console.log("[scheduler] omitted (optional)");
 try {
   ({ initScheduler } = await import("./config/services/scheduler.service.js"));
 } catch (e) {
-  console.warn("[scheduler] no cargado:", e?.message);
+  console.warn("[scheduler] not loaded:", e?.message);
 }
 
 const app = express();
 
-/* ───────── Middlewares base ───────── */
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(morgan("tiny"));
 
-/* ───────── CORS Hardening (ANTES de rutas) ─────────
-   CORS_ORIGIN="https://vex-flows-fe.vercel.app,https://vex-core-frontend.vercel.app"
-   Podés activar DEV_CORS_OPEN=true para diagnóstico temporal (refleja cualquier Origin).
-*/
 const DEV_CORS_OPEN = String(process.env.DEV_CORS_OPEN || "false").toLowerCase() === "true";
 const rawOrigins = String(process.env.CORS_ORIGIN || "")
   .split(",")
@@ -52,19 +41,10 @@ console.log("[CORS] allowset:", [...allowset], "DEV_CORS_OPEN:", DEV_CORS_OPEN);
 app.use((req, res, next) => {
   const origin = req.headers.origin;
 
-  if (req.method === "OPTIONS") {
-    console.log("[CORS OPTIONS]", {
-      origin,
-      path: req.path,
-      acrh: req.headers["access-control-request-headers"] || "",
-      acrm: req.headers["access-control-request-method"] || "",
-    });
-  }
-
   if (DEV_CORS_OPEN) {
     res.setHeader("Access-Control-Allow-Origin", origin || "*");
   } else if (origin && allowset.has(origin)) {
-    res.setHeader("Access-Control-Allow-Origin", origin); // no "*"
+    res.setHeader("Access-Control-Allow-Origin", origin);
   }
 
   res.setHeader("Vary", "Origin");
@@ -75,9 +55,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// app.use(cors()); // no necesario
-
-/* ───────── Healthcheck ───────── */
 app.get("/api/health", async (_req, res) => {
   try {
     await pingDb();
@@ -86,69 +63,61 @@ app.get("/api/health", async (_req, res) => {
     res.status(500).json({ ok: false, error: e?.message || "db error", code: e?.code });
   }
 });
-// Root 200 por si Railway chequea "/"
 app.get("/", (_req, res) => res.status(200).send("ok: vex-flows-be"));
 app.get(["/health", "/healthz"], (_req, res) => res.json({ ok: true, service: "vex-flows-backend" }));
 
-/* ───────── In-Memory MVP (no rompe si no hay DB) ───────── */
-const mem = {
-  orgId: 1,
-  providers: new Map([
-    ["gmail",    { id: "gmail",    kind: "gmail",    label: "Gmail",    desc: "1 minuto · 3 pasos",        status: "pending", credentials: {} }],
-    ["whatsapp", { id: "whatsapp", kind: "whatsapp", label: "WhatsApp", desc: "Business Accounts only",    status: "pending", credentials: {} }],
-    ["sms",      { id: "sms",      kind: "sms",      label: "SMS",      desc: "Requiere Twilio SID/Token", status: "pending", credentials: {} }],
-    ["slack",    { id: "slack",    kind: "slack",    label: "Slack",    desc: "1 minuto · 2 pasos",        status: "pending", credentials: {} }],
-  ]),
-  flows: [],           // { id, org_id, name, enabled, definition_json, ... }
-  flowRuns: [],        // { id, org_id, flow_id, flow_name, status, ... }
-};
-let seqFlow = 1;
-let seqRun  = 1;
+const PROVIDERS = [
+  { id: "gmail", kind: "gmail", label: "Gmail", desc: "1 min - 3 steps" },
+  { id: "whatsapp", kind: "whatsapp", label: "WhatsApp", desc: "Business accounts only" },
+  { id: "sms", kind: "sms", label: "SMS", desc: "Requires Twilio SID/Token" },
+  { id: "slack", kind: "slack", label: "Slack", desc: "1 min - 2 steps" },
+];
 
-// Permite a otros routers registrar runs (ej. ingestión de eventos)
-const pushRun = ({ org_id = mem.orgId, flow_id = null, flow_name, status = "ok", meta = {} }) => {
-  const now = new Date();
-  const run = {
-    id: seqRun++,
-    org_id,
-    flow_id,
-    flow_name: flow_name || "Flow",
-    status,
-    started_at: now.toISOString(),
-    finished_at: now.toISOString(),
-    ...meta,
-  };
-  mem.flowRuns.unshift(run);
-  return run;
-};
+function getOrgId(req) {
+  const raw = req?.user?.org_id || req?.user?.orgId || "1";
+  return String(raw || "1");
+}
 
-/* ───────── Providers helpers ───────── */
-const getProviders = async (_org_id) => Array.from(mem.providers.values());
+async function listProviders(org_id) {
+  const { rows } = await pool.query(
+    "SELECT provider_id, status, updated_at FROM flow_providers WHERE organizacion_id = $1",
+    [org_id]
+  );
+  const map = new Map(rows.map((r) => [r.provider_id, r]));
+  return PROVIDERS.map((p) => {
+    const row = map.get(p.id);
+    return {
+      ...p,
+      status: row?.status || "pending",
+      last_check_at: row?.updated_at || null,
+    };
+  });
+}
 
-const connectProvider = async (_org_id, id, credentials) => {
-  const p = mem.providers.get(id);
-  if (!p) throw new Error("provider_not_found");
+async function connectProvider(org_id, id, credentials) {
+  const exists = PROVIDERS.find((p) => p.id === id);
+  if (!exists) throw new Error("provider_not_found");
 
-  // Guardamos credenciales tal cual; para Slack esperamos { webhook_url }
-  p.status = "connected";
-  p.credentials = credentials || {};
-  p.last_check_at = new Date().toISOString();
-  mem.providers.set(id, p);
+  await pool.query(
+    `
+      INSERT INTO flow_providers (organizacion_id, provider_id, status, credentials, updated_at)
+      VALUES ($1,$2,'connected',$3::jsonb, now())
+      ON CONFLICT (organizacion_id, provider_id)
+      DO UPDATE SET status = 'connected', credentials = EXCLUDED.credentials, updated_at = now()
+    `,
+    [org_id, id, JSON.stringify(credentials || {})]
+  );
 
-  // Test mínimo de Slack si viene webhook
-  if (id === "slack" && p.credentials?.webhook_url) {
-    try {
-      await postToSlack(p.credentials.webhook_url, `✅ Vex Flows conectado (${new Date().toISOString()})`);
-    } catch (e) {
-      console.warn("[slack] test failed:", e?.message);
-    }
-  }
   return { status: "connected" };
-};
+}
 
-function getSlackWebhook(org_id = 1) {
-  const p = mem.providers.get("slack");
-  return p?.status === "connected" ? p?.credentials?.webhook_url : null;
+async function getSlackWebhook(org_id) {
+  const { rows } = await pool.query(
+    "SELECT credentials FROM flow_providers WHERE organizacion_id = $1 AND provider_id = 'slack' AND status = 'connected' LIMIT 1",
+    [org_id]
+  );
+  const creds = rows[0]?.credentials || {};
+  return creds.webhook_url || process.env.SLACK_WEBHOOK_URL || null;
 }
 
 async function postToSlack(webhookUrl, text) {
@@ -164,130 +133,38 @@ async function postToSlack(webhookUrl, text) {
   }
 }
 
-/* ───────── Recipes ───────── */
 const getRecipes = async () => ([
-  { id: "lead_whatsapp_task", title: "New lead ➜ WhatsApp + Task", trigger: "crm.lead.created" },
-  { id: "lead_won",           title: "Lead won",                   trigger: "crm.lead.won" },
-  { id: "invoice_due",        title: "Invoice expiring",           trigger: "billing.invoice.due" },
-
-  // ★ Nuevo preset: Bid sent → Slack reminders
-  {
-    id: "bid_sent_slack",
-    title: "Bid sent ➜ Slack reminders",
-    trigger: "crm.deal.bid_sent",
-    steps: [
-      { type: "slack.post", delay_days: 1,  template: "🔔 Follow-up 1/4 for *{{deal.name}}* (Bid sent yesterday)." },
-      { type: "slack.post", delay_days: 4,  template: "🔔 Follow-up 2/4 for *{{deal.name}}* (3 days later)." },
-      { type: "slack.post", delay_days: 7,  template: "🔔 Follow-up 3/4 for *{{deal.name}}* (another 3 days)." },
-      { type: "slack.post", delay_days: 12, template: "🔔 Final follow-up for *{{deal.name}}* (+5 days). Close or reschedule." },
-    ],
-  },
+  { id: "lead_whatsapp_task", title: "New lead -> WhatsApp + Task", trigger: "crm.lead.created" },
+  { id: "lead_won", title: "Lead won", trigger: "crm.lead.won" },
+  { id: "invoice_due", title: "Invoice expiring", trigger: "billing.invoice.due" },
+  { id: "bid_sent_slack", title: "Bid sent -> Slack reminders", trigger: "crm.deal.bid_sent" },
 ]);
 
-/* ───────── Flows CRUD (memoria) ───────── */
-const createFlow = async (org_id, { name, trigger, steps }) => {
-  const now = new Date();
-  const flow = {
-    id: seqFlow++,
-    org_id,
-    name: name || "New Flow",
-    enabled: true,
-    definition_json: { trigger, steps },
-    created_by: "system",
-    created_at: now.toISOString(),
-  };
-  mem.flows.push(flow);
-
-  mem.flowRuns.unshift({
-    id: seqRun++,
-    org_id,
-    flow_id: flow.id,
-    flow_name: flow.name,
-    status: "ok",
-    started_at: now.toISOString(),
-    finished_at: now.toISOString(),
-  });
-
-  return { id: flow.id, ok: true };
-};
-
-const publishFlow = async (org_id, flow_id) => {
-  const flow = mem.flows.find((f) => f.id === Number(flow_id) && f.org_id === org_id);
-  if (!flow) throw new Error("flow_not_found");
-  flow.enabled = true;
-  flow.published_at = new Date().toISOString();
-  return { ok: true, flow_id: flow.id, status: "published" };
-};
-
-const getRuns = async (org_id, limit = 20) =>
-  mem.flowRuns.filter((r) => r.org_id === org_id).slice(0, limit);
-
-/* ───────── Mini-runner: procesa steps slack.post con delay_days ───────── */
-function scheduleSlackPosts({ org_id, flow, payload }) {
-  const webhook = getSlackWebhook(org_id);
-  if (!webhook) {
-    console.warn("[slack] webhook missing; skipping");
-    return [];
-  }
-
-  const steps = flow?.definition_json?.steps || [];
-  const createdRunIds = [];
-
-  for (const s of steps) {
-    if (s?.type !== "slack.post") continue;
-
-    const delayDays = Number(s.delay_days || 0);
-    const delayMs = Math.max(0, delayDays) * 24 * 60 * 60 * 1000;
-    const runId = seqRun++;
-
-    mem.flowRuns.unshift({
-      id: runId,
-      org_id,
-      flow_id: flow.id,
-      flow_name: flow.name,
-      status: delayMs ? "scheduled" : "processing",
-      started_at: new Date().toISOString(),
-      finished_at: null,
-    });
-    createdRunIds.push(runId);
-
-    const text = (s.template || "🔔 Follow-up for *{{deal.name}}*")
-      .replaceAll("{{deal.name}}", payload?.deal?.name || payload?.deal_name || payload?.name || "deal")
-      .replaceAll("{{deal.owner}}", payload?.deal?.owner || payload?.owner || "owner");
-
-    setTimeout(async () => {
-      try {
-        await postToSlack(webhook, text);
-        const r = mem.flowRuns.find((x) => x.id === runId);
-        if (r) {
-          r.status = "ok";
-          r.finished_at = new Date().toISOString();
-        }
-      } catch (e) {
-        const r = mem.flowRuns.find((x) => x.id === runId);
-        if (r) {
-          r.status = "error";
-          r.finished_at = new Date().toISOString();
-        }
-        console.error("[slack] post failed:", e?.message);
-      }
-    }, delayMs);
-  }
-
-  return createdRunIds;
+async function createRun({
+  org_id,
+  flow_id = null,
+  flow_name = "Flow",
+  status = "pending",
+  error = null,
+  meta = {},
+}) {
+  const finishedAt = status === "ok" || status === "error" ? new Date().toISOString() : null;
+  const { rows } = await pool.query(
+    `
+      INSERT INTO flow_runs (organizacion_id, flow_id, status, error, meta, started_at, finished_at)
+      VALUES ($1,$2,$3,$4,$5::jsonb, now(), $6)
+      RETURNING id
+    `,
+    [org_id, flow_id, status, error, JSON.stringify({ flow_name, ...meta }), finishedAt]
+  );
+  return rows[0]?.id;
 }
 
-/* ───────── API mínima que consume el FE ───────── */
-
-// Públicos (GET)
-app.get("/api/providers", async (req, res) => {
+app.get("/api/providers", auth, async (req, res) => {
   try {
-    const org_id = req.user?.org_id || mem.orgId;
-    const rows = await getProviders(org_id);
-    res.json(rows.map((r) => ({
-      id: r.id, kind: r.kind, label: r.label, desc: r.desc, status: r.status,
-      last_check_at: r.last_check_at || null,
-    })));
+    const org_id = getOrgId(req);
+    const rows = await listProviders(org_id);
+    res.json(rows);
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
@@ -301,20 +178,30 @@ app.get("/api/flows/recipes", async (_req, res) => {
   }
 });
 
-app.get("/api/flow-runs", async (req, res) => {
+app.get("/api/flow-runs", auth, async (req, res) => {
   try {
-    const org_id = req.user?.org_id || mem.orgId;
+    const org_id = getOrgId(req);
     const limit = Math.min(parseInt(req.query.limit || "20", 10), 100);
-    res.json(await getRuns(org_id, limit));
+    const { rows } = await pool.query(
+      `
+        SELECT r.id, r.status, r.started_at, COALESCE(f.name, r.meta->>'flow_name') AS flow_name
+        FROM flow_runs r
+        LEFT JOIN flows f ON f.id = r.flow_id
+        WHERE r.organizacion_id = $1
+        ORDER BY r.started_at DESC
+        LIMIT $2
+      `,
+      [org_id, limit]
+    );
+    res.json(rows);
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-// Protegidos (POST)
 app.post("/api/providers/:id/connect", auth, async (req, res) => {
   try {
-    const org_id = req.user?.org_id || mem.orgId;
+    const org_id = getOrgId(req);
     const id = req.params.id;
     const credentials = req.body?.credentials || {};
     const out = await connectProvider(org_id, id, credentials);
@@ -325,23 +212,68 @@ app.post("/api/providers/:id/connect", auth, async (req, res) => {
 });
 
 app.post("/api/flows/create", auth, async (req, res) => {
+  const org_id = getOrgId(req);
+  const { name, trigger, steps } = req.body || {};
+
+  if (!name || typeof name !== "string") {
+    return res.status(400).json({ ok: false, error: "name_required" });
+  }
+  if (!trigger || typeof trigger !== "string") {
+    return res.status(400).json({ ok: false, error: "trigger_required" });
+  }
+  if (!Array.isArray(steps) || steps.length === 0) {
+    return res.status(400).json({ ok: false, error: "steps_required" });
+  }
+
+  const client = await pool.connect();
   try {
-    const org_id = req.user?.org_id || mem.orgId;
-    const payload = req.body || {};
-    const out = await createFlow(org_id, payload);
-    res.status(201).json(out);
+    await client.query("BEGIN");
+    const flowRes = await client.query(
+      `
+        INSERT INTO flows (organizacion_id, name, trigger, active, meta, created_by)
+        VALUES ($1,$2,$3,true,'{}'::jsonb,$4)
+        RETURNING id
+      `,
+      [org_id, name, trigger, req.user?.email || "system"]
+    );
+    const flowId = flowRes.rows[0].id;
+
+    for (let i = 0; i < steps.length; i += 1) {
+      const step = steps[i] || {};
+      const type = step.type;
+      if (!type) throw new Error("step_type_required");
+      const { type: _omit, ...config } = step;
+      await client.query(
+        `
+          INSERT INTO flow_steps (flow_id, organizacion_id, position, type, config)
+          VALUES ($1,$2,$3,$4,$5::jsonb)
+        `,
+        [flowId, org_id, i + 1, type, JSON.stringify(config)]
+      );
+    }
+
+    await client.query("COMMIT");
+    res.status(201).json({ ok: true, id: flowId });
   } catch (e) {
+    await client.query("ROLLBACK");
     res.status(400).json({ ok: false, error: e.message });
+  } finally {
+    client.release();
   }
 });
 
 app.post("/api/flows/publish", auth, async (req, res) => {
   try {
-    const org_id = req.user?.org_id || mem.orgId;
+    const org_id = getOrgId(req);
     const { flow_id } = req.body || {};
-    if (!flow_id) return res.status(400).json({ ok: false, error: "flow_id requerido" });
-    const out = await publishFlow(org_id, flow_id);
-    res.json(out);
+    if (!flow_id) return res.status(400).json({ ok: false, error: "flow_id_required" });
+
+    const { rowCount } = await pool.query(
+      "UPDATE flows SET active = true, updated_at = now() WHERE id = $1 AND organizacion_id = $2",
+      [flow_id, org_id]
+    );
+    if (!rowCount) return res.status(404).json({ ok: false, error: "flow_not_found" });
+    res.json({ ok: true, flow_id, status: "published" });
   } catch (e) {
     res.status(400).json({ ok: false, error: e.message });
   }
@@ -349,72 +281,57 @@ app.post("/api/flows/publish", auth, async (req, res) => {
 
 app.post("/api/triggers/emit", auth, async (req, res) => {
   try {
-    const org_id = req.user?.org_id || mem.orgId;
+    const org_id = getOrgId(req);
     const { event, payload } = req.body || {};
-    if (!event) return res.status(400).json({ ok: false, error: "event requerido" });
+    if (!event) return res.status(400).json({ ok: false, error: "event_required" });
 
-    const matches = mem.flows.filter(
-      (f) => f.org_id === org_id && f.enabled && f.definition_json?.trigger === event
+    const { rows: flows } = await pool.query(
+      "SELECT id, name FROM flows WHERE organizacion_id = $1 AND active = true AND trigger = $2",
+      [org_id, event]
     );
 
-    let createdRuns = [];
-    const now = new Date();
-
-    for (const f of matches) {
-      const hasSlack = (f.definition_json?.steps || []).some(s => s?.type === "slack.post");
-      if (hasSlack) {
-        createdRuns.push(...scheduleSlackPosts({ org_id, flow: f, payload }));
-      } else {
-        const run = {
-          id: seqRun++,
-          org_id,
-          flow_id: f.id,
-          flow_name: f.name,
-          status: "ok",
-          started_at: now.toISOString(),
-          finished_at: now.toISOString(),
-        };
-        mem.flowRuns.unshift(run);
-        createdRuns.push(run.id);
-      }
+    const createdRuns = [];
+    for (const f of flows) {
+      const runId = await createRun({
+        org_id,
+        flow_id: f.id,
+        flow_name: f.name,
+        status: "queued",
+        meta: { event, payload: payload || {} },
+      });
+      createdRuns.push(runId);
     }
 
     res.status(202).json({
       ok: true,
       event,
-      matched_flows: matches.map((f) => f.id),
+      matched_flows: flows.map((f) => f.id),
       created_runs: createdRuns,
     });
   } catch (e) {
     console.error("[emit] error:", e);
-    res.status(500).json({ ok: false, error: "emit failed" });
+    res.status(500).json({ ok: false, error: "emit_failed" });
   }
 });
 
-// Routers existentes
 app.use("/api/providers", providersRoutes);
 app.use("/api/flows", auth, flowsRoutes);
 app.use("/api/messages", auth, messagesRoutes);
 app.use("/api/triggers", auth, triggersRoutes);
 
-// ⬇️ Montamos rutas públicas usadas por Gmail Apps Script
-app.use(webhooks);      // POST /webhooks/gmail  (verifica X-VEX-SECRET y reenvía)
+app.use(webhooks);
 app.use(
   buildEventsRoutes({
-    mem,
-    pushRun,
+    createRun,
     postToSlack,
     getSlackWebhook,
-    scheduleSlackPosts,
   })
-); // POST /flows/events (CRM/Stock ingestion + recordatorios)
+);
 
-/* ───────── 404 ───────── */
 app.use((req, res) => {
   res.status(404).json({ ok: false, error: "Not found", path: req.path });
 });
 
-/* ───────── Server ───────── */
 const isRailway = !!process.env.RAILWAY_ENVIRONMENT || !!process.env.RAILWAY_STATIC_URL;
 const PORT = isRailway ? Number(process.env.PORT) : Number(process.env.PORT || 8082);
 const HOST = "0.0.0.0";
@@ -430,8 +347,14 @@ app.listen(PORT, HOST, async () => {
     CORE_URL: process.env.CORE_URL,
   });
 
-  try { await initSchema(); } catch {}
-  try { initScheduler(app); } catch (e) { console.error("❌ Scheduler error:", e?.message); }
+  try {
+    await initSchema();
+  } catch {}
+  try {
+    initScheduler(app);
+  } catch (e) {
+    console.error("[scheduler] error:", e?.message);
+  }
 });
 
 process.on("unhandledRejection", (reason) => console.error("UNHANDLED REJECTION:", reason));

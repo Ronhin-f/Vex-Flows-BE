@@ -1,4 +1,4 @@
-### ===== SELECCIONAR BACKEND =====
+﻿### ===== SELECT BACKEND =====
 @base = https://TU-BACKEND.railway.app
 # @base = http://127.0.0.1:8082
 
@@ -38,19 +38,19 @@ Content-Type: {{json}}
 
 > {%
 /**
- * Guarda el id del flow creado para usarlo en Publish.
+ * Save created flow id for publish.
  * (VS Code REST Client)
  */
 try {
   const data = JSON.parse(response.body);
   if (data && data.id) {
     client.global.set("flow_id", data.id);
-    client.log("flow_id guardado: " + data.id);
+    client.log("flow_id saved: " + data.id);
   } else {
-    client.log("No se pudo leer flow_id del response");
+    client.log("Could not read flow_id from response");
   }
 } catch (e) {
-  client.log("Error parseando response: " + e.message);
+  client.log("Response parse error: " + e.message);
 }
 %}
 
@@ -79,5 +79,5 @@ Content-Type: {{json}}
 }
 
 
-### Activity (últimos 10)
+### Activity (ultimos 10)
 GET {{base}}/api/flow-runs?limit=10

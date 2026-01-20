@@ -1,30 +1,30 @@
-// backend/config/services/scheduler.service.js
+﻿// backend/config/services/scheduler.service.js
 import cron from "node-cron";
 
-// Guardia global para evitar doble inicio incluso si lo importan dos veces
+// Global guard to avoid double start
 const SCHED_FLAG = Symbol.for("vex.scheduler.started");
 
 export function initScheduler(app) {
   if (globalThis[SCHED_FLAG]) {
-    console.log("🕒 Scheduler ya iniciado (skip)");
+    console.log("[scheduler] already started (skip)");
     return;
   }
   globalThis[SCHED_FLAG] = true;
 
   try {
-    // Ejemplo: corre cada minuto (ajustá a tus jobs)
+    // Example: run every minute
     cron.schedule("* * * * *", async () => {
       try {
-        // TODO: tu lógica real
+        // TODO: real jobs
         // console.log("[cron] tick");
       } catch (err) {
         console.error("[cron] error:", err?.message);
       }
     });
 
-    console.log("🕒 Scheduler iniciado");
+    console.log("[scheduler] started");
   } catch (e) {
-    // Nunca dejes que el scheduler mate el proceso
-    console.error("❌ Scheduler error:", e?.message);
+    // Do not let scheduler crash the process
+    console.error("[scheduler] error:", e?.message);
   }
 }

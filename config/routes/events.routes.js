@@ -1,25 +1,13 @@
-import express from "express";
+﻿import express from "express";
 
 /**
- * Endpoint de ingestion unificada para eventos de CRM/Stock.
- *
- * Payload:
- * {
- *   source: "crm" | "stock",
- *   event:  "crm.deal.bid_sent" | "crm.deal.stalled" | "crm.deal.won" | "stock.product.low" | "stock.order.delayed",
- *   payload: { ... } // ver handlers abajo
- * }
- *
- * Seguridad:
- *  - Si EVENTS_TOKEN está seteado, exigimos header X-Events-Token o Authorization: Bearer <token>
- *  - Si no, es público (solo para PoC).
+ * Unified ingestion endpoint for CRM/Stock events.
+ * Requires org_id in payload or authenticated user.
  */
 export default function buildEventsRouter({
-  mem,
-  pushRun,
+  createRun,
   postToSlack,
   getSlackWebhook,
-  scheduleSlackPosts,
 }) {
   const router = express.Router();
   const EVENTS_TOKEN = process.env.EVENTS_TOKEN || "";
@@ -32,8 +20,14 @@ export default function buildEventsRouter({
     return res.status(401).json({ ok: false, error: "invalid_events_token" });
   }
 
+  function resolveOrgId(req, payload) {
+    const fromPayload = payload?.org_id || payload?.organizacion_id;
+    const fromUser = req.user?.org_id || req.user?.orgId;
+    return fromPayload || fromUser || null;
+  }
+
   async function notifySlack(org_id, text) {
-    const webhook = getSlackWebhook?.(org_id) || process.env.SLACK_WEBHOOK_URL;
+    const webhook = (await getSlackWebhook?.(org_id)) || process.env.SLACK_WEBHOOK_URL;
     if (!webhook) return;
     try {
       await postToSlack(webhook, text);
@@ -45,95 +39,89 @@ export default function buildEventsRouter({
   router.post("/flows/events", authGuard, express.json(), async (req, res) => {
     try {
       const { source = "crm", event, payload = {} } = req.body || {};
-      if (!event) return res.status(400).json({ ok: false, error: "event requerido" });
+      if (!event) return res.status(400).json({ ok: false, error: "event_required" });
 
-      const org_id = payload.org_id || mem?.orgId || 1;
+      const org_id = resolveOrgId(req, payload);
+      if (!org_id) return res.status(400).json({ ok: false, error: "org_id_required" });
+
       const handled = { notified: false, runs: [] };
 
-      // --- CRM handlers ---
       if (source === "crm" || event.startsWith("crm.")) {
         switch (event) {
           case "crm.deal.bid_sent": {
-            // Cadencia de Slack (reusa scheduleSlackPosts si hay webhook)
-            const flow = {
-              id: 9_001,
-              name: "Bid sent -> Slack reminders",
-              definition_json: {
-                steps: [
-                  { type: "slack.post", delay_days: 1, template: "Follow-up 1/4 for *{{deal.name}}* (bid sent)" },
-                  { type: "slack.post", delay_days: 4, template: "Follow-up 2/4 for *{{deal.name}}*" },
-                  { type: "slack.post", delay_days: 7, template: "Follow-up 3/4 for *{{deal.name}}*" },
-                  { type: "slack.post", delay_days: 12, template: "Final follow-up for *{{deal.name}}*" },
-                ],
-              },
-            };
-            const created = scheduleSlackPosts ? scheduleSlackPosts({ org_id, flow, payload }) : [];
-            if (created.length === 0 && pushRun) {
-              const r = pushRun({
-                org_id,
-                flow_name: flow.name,
-                status: "scheduled",
-                meta: { event, deal: payload?.deal?.name || payload?.deal_name },
-              });
-              handled.runs.push(r?.id);
-            } else {
-              handled.runs.push(...created);
-            }
+            const flowName = "Bid sent -> Slack reminders";
+            const runId = await createRun({
+              org_id,
+              flow_name: flowName,
+              status: "queued",
+              meta: { event, payload },
+            });
+            handled.runs.push(runId);
             handled.notified = true;
             break;
           }
           case "crm.deal.stalled": {
             const deal = payload?.deal?.name || payload?.deal_name || "Deal";
             const owner = payload?.deal?.owner || payload?.owner || "owner";
-            const text = `⚠️ Deal estancado: *${deal}* (owner: ${owner})`;
+            const text = `Deal stalled: ${deal} (owner: ${owner})`;
             await notifySlack(org_id, text);
-            if (pushRun) {
-              const r = pushRun({ org_id, flow_name: "Deal stalled reminder", status: "ok", meta: { event, deal } });
-              handled.runs.push(r?.id);
-            }
+            const runId = await createRun({
+              org_id,
+              flow_name: "Deal stalled reminder",
+              status: "ok",
+              meta: { event, deal },
+            });
+            handled.runs.push(runId);
             handled.notified = true;
             break;
           }
           case "crm.deal.won": {
             const deal = payload?.deal?.name || payload?.deal_name || "Deal";
-            const text = `🏁 Deal ganado: *${deal}*`;
+            const text = `Deal won: ${deal}`;
             await notifySlack(org_id, text);
-            if (pushRun) {
-              const r = pushRun({ org_id, flow_name: "Deal won thank-you", status: "ok", meta: { event, deal } });
-              handled.runs.push(r?.id);
-            }
+            const runId = await createRun({
+              org_id,
+              flow_name: "Deal won thank-you",
+              status: "ok",
+              meta: { event, deal },
+            });
+            handled.runs.push(runId);
             handled.notified = true;
             break;
           }
           default:
-            // Otros eventos CRM no manejados
             break;
         }
       }
 
-      // --- Stock handlers ---
       if (source === "stock" || event.startsWith("stock.")) {
         switch (event) {
           case "stock.product.low": {
             const sku = payload?.product?.sku || payload?.sku || "SKU";
             const qty = payload?.product?.qty || payload?.qty || "?";
-            const text = `📦 Stock bajo: ${sku} (qty: ${qty})`;
+            const text = `Stock low: ${sku} (qty: ${qty})`;
             await notifySlack(org_id, text);
-            if (pushRun) {
-              const r = pushRun({ org_id, flow_name: "Low stock reminder", status: "ok", meta: { event, sku, qty } });
-              handled.runs.push(r?.id);
-            }
+            const runId = await createRun({
+              org_id,
+              flow_name: "Low stock reminder",
+              status: "ok",
+              meta: { event, sku, qty },
+            });
+            handled.runs.push(runId);
             handled.notified = true;
             break;
           }
           case "stock.order.delayed": {
             const order = payload?.order?.id || payload?.order_id || "order";
-            const text = `⏳ Pedido atrasado: ${order}`;
+            const text = `Order delayed: ${order}`;
             await notifySlack(org_id, text);
-            if (pushRun) {
-              const r = pushRun({ org_id, flow_name: "Order delayed reminder", status: "ok", meta: { event, order } });
-              handled.runs.push(r?.id);
-            }
+            const runId = await createRun({
+              org_id,
+              flow_name: "Order delayed reminder",
+              status: "ok",
+              meta: { event, order },
+            });
+            handled.runs.push(runId);
             handled.notified = true;
             break;
           }
