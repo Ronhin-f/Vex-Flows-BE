@@ -1,4 +1,5 @@
 ﻿import express from "express";
+import auth from "../middleware/auth.js";
 
 /**
  * Unified ingestion endpoint for CRM/Stock events.
@@ -26,6 +27,14 @@ export default function buildEventsRouter({
     return fromPayload || fromUser || null;
   }
 
+  async function optionalAuth(req, res, next) {
+    const hasBearer =
+      typeof req.headers.authorization === "string" &&
+      req.headers.authorization.startsWith("Bearer ");
+    if (!hasBearer) return next();
+    return auth(req, res, next);
+  }
+
   async function notifySlack(org_id, text) {
     const webhook = (await getSlackWebhook?.(org_id)) || process.env.SLACK_WEBHOOK_URL;
     if (!webhook) return;
@@ -36,7 +45,7 @@ export default function buildEventsRouter({
     }
   }
 
-  router.post("/flows/events", authGuard, express.json(), async (req, res) => {
+  router.post("/flows/events", authGuard, optionalAuth, express.json(), async (req, res) => {
     try {
       const { source = "crm", event, payload = {} } = req.body || {};
       if (!event) return res.status(400).json({ ok: false, error: "event_required" });
